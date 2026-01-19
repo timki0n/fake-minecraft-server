@@ -26,10 +26,18 @@ function main() {
     server.on('connection', handleSocket);
 
     // Start listening
+    const port =
+    Number.parseInt(process.env.PORT, 10) ||
+    Number.parseInt(process.env.SERVER_PORT, 10) ||
+    Number.parseInt(process.env.LISTEN_PORT, 10) ||
+    25565;
+
+    const host = process.env.LISTEN_HOST || '0.0.0.0';
+
     const listenOpts = {
-        host: process.env.LISTEN_HOST || undefined,
-        port: parseInt(process.env.LISTEN_PORT) || 25565,
-        backlog: parseInt(process.env.LISTEN_BACKLOG) || undefined,
+    host,
+    port,
+    backlog: Number.parseInt(process.env.LISTEN_BACKLOG, 10) || undefined,
     };
     const listenErrorHandler = () => process.exit(1);
     server.on('error', listenErrorHandler);
