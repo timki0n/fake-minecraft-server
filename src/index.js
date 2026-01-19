@@ -42,6 +42,47 @@ function main() {
     const listenErrorHandler = () => process.exit(1);
     server.on('error', listenErrorHandler);
     server.listen(listenOpts, () => server.off('error', listenErrorHandler));
+
+    // Setup graceful shutdown
+    setupGracefulShutdown(server);
+}
+
+/**
+ * Sets up graceful shutdown handlers for SIGTERM and SIGINT signals.
+ *
+ * @param {net.Server} server - The server instance to shut down.
+ */
+function setupGracefulShutdown(server) {
+    let isShuttingDown = false;
+
+    const shutdown = (signal) => {
+        if (isShuttingDown) {
+            return;
+        }
+        isShuttingDown = true;
+
+        log(`Received ${signal}, starting graceful shutdown...`);
+
+        // Stop accepting new connections
+        server.close((err) => {
+            if (err) {
+                log(`Error during server close: ${err.message}`);
+                process.exit(1);
+            }
+            log('Server closed successfully');
+            process.exit(0);
+        });
+
+        // Force shutdown after timeout (10 seconds)
+        const SHUTDOWN_TIMEOUT = 10000;
+        setTimeout(() => {
+            log('Shutdown timeout reached, forcing exit');
+            process.exit(1);
+        }, SHUTDOWN_TIMEOUT).unref();
+    };
+
+    process.on('SIGTERM', () => shutdown('SIGTERM'));
+    process.on('SIGINT', () => shutdown('SIGINT'));
 }
 
 /**
@@ -161,39 +202,51 @@ function handleSocket(socket) {
         log(`Protocol Version: ${loginData.protocolVersion}`);
         log(`===================================`);
 
-        // Send webhook to n8n
-        sendWebhook(loginData);
-
-        socket.end(getKickPacket(handshakeData));
+        // Fetch kick message from n8n webhook (async)
+        fetchKickMessage(loginData.username).then((kickMessage) => {
+            socket.end(getKickPacket(handshakeData, kickMessage));
+        });
     });
 }
 
 /**
- * Sends login data to n8n webhook.
+ * Fetches kick message from n8n webhook.
+ * Returns dynamic message based on server status (sleeping, maintenance, no auth, etc.)
  *
- * @param {Object} data - The login data to send.
+ * @param {string} username - The player's username.
+ * @returns {Promise<string|null>} - The kick message from webhook or null if unavailable.
  */
-async function sendWebhook(data) {
+async function fetchKickMessage(username) {
     if (!N8N_WEBHOOK_URL) {
-        return;
+        return null;
     }
 
     try {
-        const response = await fetch(N8N_WEBHOOK_URL, {
-            method: 'POST',
+        const url = new URL(N8N_WEBHOOK_URL);
+        url.searchParams.set('username', username);
+        
+        const response = await fetch(url.toString(), {
+            method: 'GET',
             headers: {
-                'Content-Type': 'application/json',
+                'Accept': 'application/json',
             },
-            body: JSON.stringify(data),
         });
 
         if (response.ok) {
-            log(`Webhook sent successfully for ${data.username}`);
+            const data = await response.json();
+            log(`Webhook response for ${username}: ${JSON.stringify(data)}`);
+            
+            // Support multiple response formats:
+            // { "message": "..." } or { "kick_message": "..." } or { "text": "..." }
+            const kickMessage = data.message || data.kick_message || data.text || null;
+            return kickMessage;
         } else {
             log(`Webhook failed: ${response.status} ${response.statusText}`);
+            return null;
         }
     } catch (err) {
         log(`Webhook error: ${err.message}`);
+        return null;
     }
 }
 
@@ -224,13 +277,20 @@ function readFavicon(strOrPath) {
     }
 }
 
-const getKickPacket = (() => {
-    const packet = writeStringPacket(
-        0,
-        JSON.stringify(parseChatComponent(process.env.KICK_MESSAGE || '§cNot available'))
-    );
-    return (handshake) => packet;
-})();
+const DEFAULT_KICK_MESSAGE = process.env.KICK_MESSAGE || '§cNot available';
+
+/**
+ * Creates a kick packet with the given message.
+ * If dynamicMessage is provided, uses it; otherwise falls back to KICK_MESSAGE env.
+ *
+ * @param {Object} handshake - The handshake data.
+ * @param {string|null} dynamicMessage - Dynamic message from webhook (optional).
+ * @returns {Buffer} - The kick packet.
+ */
+function getKickPacket(handshake, dynamicMessage = null) {
+    const message = dynamicMessage || DEFAULT_KICK_MESSAGE;
+    return writeStringPacket(0, JSON.stringify(parseChatComponent(message)));
+}
 
 const getServerListPacket = (() => {
     // TODO: Allow PROTOCOL_VERSION=auto to copy the client's one
