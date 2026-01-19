@@ -2,9 +2,10 @@ import 'dotenv/config';
 import {createServer} from 'node:net';
 import {readFileSync} from 'node:fs';
 import {log, formatAddress} from './utils.js';
-import {ByteBuf, readHandshake, writeStringPacket, PACKET_PONG} from './mc-protocol.js';
+import {ByteBuf, readHandshake, readLoginStart, writeStringPacket, PACKET_PONG} from './mc-protocol.js';
 
 const HANDSHAKE_TIMEOUT = 2000; // ms
+const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL || null;
 
 function main() {
     const server = createServer();
@@ -13,6 +14,9 @@ function main() {
     server.on('listening', () => {
         const {address, port} = server.address();
         log(`Listening on ${formatAddress(address)}:${port}`);
+        if (N8N_WEBHOOK_URL) {
+            log(`N8N Webhook: ${N8N_WEBHOOK_URL}`);
+        }
     });
     server.on('error', (err) => {
         log('Server Error:', err);
@@ -69,6 +73,7 @@ function handleSocket(socket) {
 
     // Add data handler
     const buf = new ByteBuf();
+    let handshakeData = null; // Store handshake for login state
     socket.on('data', (data) => {
         if (socket.readyState !== 'open') {
             // always skip data after a call to socket.end()
@@ -79,30 +84,109 @@ function handleSocket(socket) {
             return; // skip (already answered)
         }
 
-        // Read the handshake
         buf.append(data);
+
+        // If we haven't received handshake yet, try to read it
+        if (!handshakeData) {
+            buf.resetOffset();
+            const handshake = readHandshake(buf);
+            if (handshake === undefined) {
+                return; // skip (missing data)
+            }
+            if (handshake === false) {
+                // fail (illegal handshake)
+                socket.destroy(new Error('Illegal handshake'));
+                return;
+            }
+
+            log(`${name} sent handshake: ${JSON.stringify(handshake)}`);
+
+            // For status requests, respond immediately
+            if (handshake.state === 1) {
+                answered = true;
+                socket.write(getServerListPacket(handshake));
+                socket.end(PACKET_PONG);
+                return;
+            }
+
+            // For login requests, store handshake and wait for Login Start packet
+            handshakeData = handshake;
+            // Remove processed handshake data from buffer
+            buf.data = buf.data.slice(buf.offset);
+            buf.resetOffset();
+        }
+
+        // We're in login state, try to read Login Start packet
         buf.resetOffset();
-        const handshake = readHandshake(buf);
-        if (handshake === undefined) {
+        const loginStart = readLoginStart(buf);
+        if (loginStart === undefined) {
             return; // skip (missing data)
         }
-        if (handshake === false) {
-            // fail (illegal handshake)
-            socket.destroy(new Error('Illegal handshake'));
+        if (loginStart === false) {
+            // fail (illegal login start)
+            socket.destroy(new Error('Illegal login start'));
             return;
         }
 
-        log(`${name} sent handshake: ${JSON.stringify(handshake)}`);
-
-        // Respond and close the socket
+        // Login attempt - log detailed client information
         answered = true;
-        if (handshake.state === 2) {
-            socket.end(getKickPacket(handshake));
-        } else {
-            socket.write(getServerListPacket(handshake));
-            socket.end(PACKET_PONG);
+        const loginData = {
+            username: loginStart.username,
+            uuid: loginStart.uuid || null,
+            clientIp: socket.remoteAddress,
+            clientPort: socket.remotePort,
+            targetHost: handshakeData.hostname,
+            targetPort: handshakeData.port,
+            protocolVersion: handshakeData.protocolVersion,
+            timestamp: new Date().toISOString(),
+        };
+
+        log(`========== LOGIN ATTEMPT ==========`);
+        log(`Username: ${loginData.username}`);
+        if (loginData.uuid) {
+            log(`UUID: ${loginData.uuid}`);
         }
+        log(`Client IP: ${loginData.clientIp}`);
+        log(`Client Port: ${loginData.clientPort}`);
+        log(`Target Host: ${loginData.targetHost}`);
+        log(`Target Port: ${loginData.targetPort}`);
+        log(`Protocol Version: ${loginData.protocolVersion}`);
+        log(`===================================`);
+
+        // Send webhook to n8n
+        sendWebhook(loginData);
+
+        socket.end(getKickPacket(handshakeData));
     });
+}
+
+/**
+ * Sends login data to n8n webhook.
+ *
+ * @param {Object} data - The login data to send.
+ */
+async function sendWebhook(data) {
+    if (!N8N_WEBHOOK_URL) {
+        return;
+    }
+
+    try {
+        const response = await fetch(N8N_WEBHOOK_URL, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify(data),
+        });
+
+        if (response.ok) {
+            log(`Webhook sent successfully for ${data.username}`);
+        } else {
+            log(`Webhook failed: ${response.status} ${response.statusText}`);
+        }
+    } catch (err) {
+        log(`Webhook error: ${err.message}`);
+    }
 }
 
 function parseChatComponent(str) {

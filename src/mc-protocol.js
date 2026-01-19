@@ -263,3 +263,67 @@ export const PACKET_PONG = (() => {
     buf.writeUInt32BE(818, 6); // client time
     return buf;
 })();
+
+/**
+ * The maximum length of a login start packet in bytes.
+ * @type {number}
+ */
+const LOGIN_START_MAX_LEN = 100; // (packetLen)2 + (packetId)1 + (name)2+64 + (uuid)17
+
+/**
+ * Reads a Minecraft Login Start packet from a buffer.
+ *
+ * @param {ByteBuf} buf - The buffer to read from.
+ * @returns {Object|boolean|undefined}
+ *  An object containing the player's username (and optionally UUID) if successful;
+ *  `false` if the packet is invalid;
+ *  or `undefined` if there is missing data to wait.
+ */
+export function readLoginStart(buf) {
+    // read packet len
+    const packetLen = buf.readVarInt(2, true);
+    if (packetLen === undefined) {
+        return; // skip (missing data)
+    }
+    if (packetLen === false || packetLen > LOGIN_START_MAX_LEN) {
+        return false; // fail (too long packet)
+    }
+    if (packetLen > buf.length()) {
+        return; // skip (missing data)
+    }
+
+    // read packet id
+    const packetId = buf.readVarInt(1);
+    if (packetId === false || packetId !== 0) {
+        return false; // fail (not a login start)
+    }
+
+    // read username (max 16 characters, up to 64 bytes in UTF-8)
+    const username = buf.readString(2, 64);
+    if (username === false || username.length === 0 || username.length > 16) {
+        return false; // fail (illegal username)
+    }
+
+    // Try to read UUID (optional, depends on protocol version)
+    let uuid = null;
+    const hasUuid = buf.readUnsignedByte();
+    if (hasUuid === 1 && buf.offset + 16 <= buf.length()) {
+        // Read UUID (16 bytes)
+        const uuidBytes = buf.data.slice(buf.offset, buf.offset + 16);
+        buf.offset += 16;
+        uuid = formatUUID(uuidBytes);
+    }
+
+    return {username, uuid};
+}
+
+/**
+ * Formats UUID bytes into a string.
+ *
+ * @param {Buffer} bytes - 16 bytes of UUID data.
+ * @returns {string} Formatted UUID string.
+ */
+function formatUUID(bytes) {
+    const hex = bytes.toString('hex');
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
